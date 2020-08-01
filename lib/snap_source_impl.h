@@ -27,8 +27,6 @@
 #include <boost/circular_buffer.hpp>
 #include <ata/snap_source.h>
 
-#include "packet_headers.h"
-
 namespace gr {
 namespace ata {
 
@@ -69,6 +67,11 @@ protected:
 
   uint64_t get_header_seqnum();
 
+  enum class DataFormat {
+    Voltage = 1,
+    Spectrometer = 2
+  }
+
 public:
   snap_source_impl(size_t itemsize, size_t vecLen, int port, int headerType,
                   int payloadsize, bool notifyMissed,
@@ -80,9 +83,6 @@ public:
   size_t data_available();
   inline size_t netdata_available();
 
-  // Where all the action really happens
-  int work_test(int noutput_items, gr_vector_const_void_star &input_items,
-                gr_vector_void_star &output_items);
   int work(int noutput_items, gr_vector_const_void_star &input_items,
            gr_vector_void_star &output_items);
 };

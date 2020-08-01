@@ -30,64 +30,57 @@
 namespace gr {
 namespace ata {
 
-snap_source::sptr snap_source::make(size_t itemsize, size_t vecLen, int port,
+snap_source::sptr snap_source::make(size_t itemsize, size_t vlen, int port,
                                   int headerType, int payloadsize,
                                   bool notifyMissed,
                                   bool sourceZeros, bool ipv6) {
   return gnuradio::get_initial_sptr(
-      new snap_source_impl(itemsize, vecLen, port, headerType, payloadsize,
+      new snap_source_impl(itemsize, vlen, port, headerType, payloadsize,
                           notifyMissed, sourceZeros, ipv6));
 }
 
 /*
  * The private constructor
  */
-snap_source_impl::snap_source_impl(size_t itemsize, size_t vecLen, int port,
+snap_source_impl::snap_source_impl(size_t itemsize, size_t vlen, int port,
                                  int headerType, int payloadsize,
                                  bool notifyMissed,
                                  bool sourceZeros, bool ipv6)
-    : gr::sync_block("snap_source", gr::io_signature::make(0, 0, 0),
-                     gr::io_signature::make(1, 1, itemsize * vecLen)) {
+    : gr::sync_block("snap_source",
+                     gr::io_signature::make(0, 0, 0),
+                     gr::io_signature::make(1, 2, sizeof(char) * vlen)) {
+
   is_ipv6 = ipv6;
 
   d_itemsize = itemsize;
-  d_veclen = vecLen;
+  d_veclen = vlen;
 
-  d_block_size = d_itemsize * d_veclen;
   d_port = port;
   d_seq_num = 0;
   d_notifyMissed = notifyMissed;
   d_sourceZeros = sourceZeros;
+  d_partialFrameCounter = 0;
+  
   d_header_type = headerType;
 
+  d_block_size = d_itemsize * d_veclen;
   d_payloadsize = payloadsize;
-  d_partialFrameCounter = 0;
 
+  // Configure packet parser
   d_header_size = 0;
-
-  switch (d_header_type) {
-  case HEADERTYPE_SEQNUM:
-    d_header_size = sizeof(HeaderSeqNum);
+  switch (static_cast<DataFormat>(d_header_type)) {
+  case Voltage:
+    d_header_size = 8;
+    d_payload_size = 256 * 16 * 2; // channels * time steps * pols * sizeof(sc4)
     break;
 
-  case HEADERTYPE_SEQPLUSSIZE:
-    d_header_size = sizeof(HeaderSeqPlusSize);
-    break;
-
-  case HEADERTYPE_CHDR:
-    d_header_size = sizeof(CHDR);
-    break;
-
-  case HEADERTYPE_OLDATA:
-    d_header_size = sizeof(OldATAHeader);
-    break;
-
-  case HEADERTYPE_NONE:
-    d_header_size = 0;
+  case Spectrometer:
+    d_header_size = 8;
+    d_payload_size = 512 * 4 * 4; // channels * pols * sizeof(uint32_t)
     break;
 
   default:
-    GR_LOG_ERROR(d_logger, "Unknown header type.");
+    GR_LOG_ERROR(d_logger, "Unknown source data format.");
     exit(1);
     break;
   }
@@ -99,24 +92,18 @@ snap_source_impl::snap_source_impl(size_t itemsize, size_t vecLen, int port,
     exit(1);
   }
 
+  // Not sure the purpose of these vars
   d_precompDataSize = d_payloadsize - d_header_size;
   d_precompDataOverItemSize = d_precompDataSize / d_itemsize;
 
-  localBuffer = new char[d_payloadsize];
+  localBuffer = new char[d_header_size + d_payload_size];
   long maxCircBuffer;
 
-  // Let's keep it from getting too big
-  if (d_payloadsize < 2000) {
-    maxCircBuffer = d_payloadsize * 4000;
-  } else {
-    if (d_payloadsize < 5000)
-      maxCircBuffer = d_payloadsize * 2000;
-    else
-      maxCircBuffer = d_payloadsize * 1500;
-  }
-
+  // Compute reasonable buffer size
+  maxCircBuffer = d_payloadsize * 1500; // 12 MiB
   d_localqueue = new boost::circular_buffer<char>(maxCircBuffer);
 
+  // Initialize receiving socket
   if (is_ipv6)
     d_endpoint =
         boost::asio::ip::udp::endpoint(boost::asio::ip::udp::v6(), port);
@@ -124,27 +111,29 @@ snap_source_impl::snap_source_impl(size_t itemsize, size_t vecLen, int port,
     d_endpoint =
         boost::asio::ip::udp::endpoint(boost::asio::ip::udp::v4(), port);
 
+  // TODO: Move opening of the socket to ::start()
   try {
     d_udpsocket = new boost::asio::ip::udp::socket(d_io_service, d_endpoint);
   } catch (const std::exception &ex) {
-    throw std::runtime_error(std::string("[UDP Source] Error occurred: ") +
+    throw std::runtime_error(std::string("[SNAP Source] Error occurred: ") +
                              ex.what());
   }
-
-  int out_multiple = (d_payloadsize - d_header_size) / d_block_size;
-
-  if (out_multiple == 1)
-	  out_multiple = 2; // Ensure we get pairs, for instance complex -> ichar pairs
 
   std::stringstream msg_stream;
   msg_stream << "Listening for data on UDP port " << port << ".";
   GR_LOG_INFO(d_logger, msg_stream.str());
 
+  // Configure output data block size
+  int out_multiple = (d_payloadsize - d_header_size) / d_block_size;
+
+  if (out_multiple == 1)
+	  out_multiple = 2; // Ensure we get pairs, for instance complex -> ichar pairs
+
   gr::block::set_output_multiple(out_multiple);
 }
 
 /*
- * Our virtual destructor.
+ * Our destructor.
  */
 snap_source_impl::~snap_source_impl() { stop(); }
 
@@ -171,12 +160,7 @@ bool snap_source_impl::stop() {
 }
 
 size_t snap_source_impl::data_available() {
-  // Get amount of data available
-  boost::asio::socket_base::bytes_readable command(true);
-  d_udpsocket->io_control(command);
-  size_t bytes_readable = command.get();
-
-  return (bytes_readable + d_localqueue->size());
+  return (netdata_available() + d_localqueue->size());
 }
 
 size_t snap_source_impl::netdata_available() {
@@ -188,6 +172,7 @@ size_t snap_source_impl::netdata_available() {
   return bytes_readable;
 }
 
+// Parse the packet header to get the sequence number
 uint64_t snap_source_impl::get_header_seqnum() {
   uint64_t retVal = 0;
 
@@ -367,18 +352,22 @@ int snap_source_impl::work(int noutput_items,
   static bool firstTime = true;
   static int underRunCounter = 0;
 
+  char *out_i = (char *) output_items[0];
+  char *out_q = (char *) output_items[1];
+  
   int bytesAvailable = netdata_available();
-  char *out = (char *)output_items[0];
   unsigned int numRequested = noutput_items * d_block_size;
 
-  // quick exit if nothing to do
+  // Handle case where no data is available
   if ((bytesAvailable == 0) && (d_localqueue->size() == 0)) {
     underRunCounter++;
     d_partialFrameCounter = 0;
+
     if (d_sourceZeros) {
       // Just return 0's
       memset((void *)out, 0x00, numRequested); // numRequested will be in bytes
       return noutput_items;
+
     } else {
       if (underRunCounter == 0) {
         if (!firstTime) {
@@ -390,6 +379,7 @@ int snap_source_impl::work(int noutput_items,
           underRunCounter = 0;
       }
 
+      // Returning 0 causes GNU Radio to call work again in 0.1s
       return 0;
     }
   }
@@ -420,7 +410,8 @@ int snap_source_impl::work(int noutput_items,
       d_read_buffer.consume(bytesRead);
     }
   }
-
+  
+  // Handle partial packets
   if (d_localqueue->size() < d_payloadsize) {
     // since we should be getting these in UDP packet blocks matched on the
     // sender/receiver, this should be a fringe case, or a case where another
